@@ -184,32 +184,103 @@ if (menu == "시도별 전기차 현황" or menu == "시도별 충전소 현황"
         st.bar_chart(chart_df, height=480, use_container_width=True)
         st.caption("<출처: 국토교통부 및 공공데이터포털 통계>")
 
-    # ----------------------------------------------------------------------
-    # 하단부: 뒤집혀서 저장된 DB 원본 데이터를 이쁘게 추이 표로 출력
-    # ----------------------------------------------------------------------
-    st.write("---")
-    st.subheader(f"📈 {menu.split()[-2]} 다년도 추이 표 (DB 실시간 데이터)")
+    # ──────────────────────────────────────────────────────────────────
+    # ── 4. DB 실시간 데이터 분석 (띄어쓰기 매칭 및 충전소 그래프 출력 완벽 해결본) ──
+    # ──────────────────────────────────────────────────────────────────
     
-    df_trend = load_yearly_trend(db_table_name)
-    
-    if df_trend is not None and not df_trend.empty:
-        # 실제 DB 데이터가 있을 때는 불필요한 인덱스(0,1,2..)를 숨기고 화면에 꽉 채워 표만 깔끔하게 출력합니다.
-        st.dataframe(df_trend, use_container_width=True, hide_index=True)
-    else:
-        # DB 연동이 완전히 실패했을 때만 작동하는 백업 영역입니다.
-        # 기존에 밖에 나와있던 "st.caption(f'단위 : {unit_label} (%)')" 코드를 이 else 블록 안으로 격리하여 
-        # 정상 출력 시에는 화면에 절대 나타나지 않도록 수정했습니다.
-        st.caption(f"⚠️ DB 연결 실패로 인한 임시 데이터 표입니다. (단위 : {unit_label})")
-        total_val = df_ev[data_column].sum()
-        columns_layout = ["연월"] + df_ev["지역"].tolist() + ["계"]
+    # 데이터베이스로부터 두 테이블 데이터 로드
+    try:
+        query_reg = "SELECT * FROM ev_registration"
+        df_reg_raw = pd.read_sql(query_reg, engine)
         
-        row_data = ["2025 (10월 기준)"]
-        for _, row in df_ev.iterrows():
-            row_data.append(f"{int(row[data_column]):,}<br>({row[ratio_column]}%)")
-        row_data.append(f"**{total_val:,}**")
+        query_chg = "SELECT * FROM ev_charger"
+        df_chg_raw = pd.read_sql(query_chg, engine)
         
-        grid_df = pd.DataFrame([row_data], columns=columns_layout)
-        st.write(grid_df.to_html(escape=False, index=False), unsafe_allow_html=True)
+        db_data_loaded = True
+    except Exception as e:
+        st.error(f"실시간 추이 데이터를 DB에서 로드하는 데 실패했습니다: {e}")
+        db_data_loaded = False
+
+    if db_data_loaded and not df_reg_raw.empty and not df_chg_raw.empty:
+        
+        # 1. 이름과 상관없이 첫 번째 컬럼(연도 행)을 인덱스로 세팅하고 정렬
+        reg_first_col = df_reg_raw.columns[0]
+        df_reg_data = df_reg_raw.set_index(reg_first_col).sort_index()
+        
+        chg_first_col = df_chg_raw.columns[0]
+        df_chg_data = df_chg_raw.set_index(chg_first_col).sort_index()
+
+        # 순수 도시 이름 리스트 추출 (ev_registration 컬럼 기준, '합계' 제외)
+        available_provinces = [col for col in df_reg_data.columns if col != '합계']
+
+        st.write("---")
+        
+        # 📌 [메뉴 1] 시도별 전기차 현황
+        if menu == "시도별 전기차 현황":
+            st.markdown("### 🚗 시도별 전기차 등록 현황 연도별 추이")
+            st.caption("비교하고 싶은 시도(지역)를 다중 선택하여 연도별 증가 추이를 한눈에 비교할 수 있습니다.")
+            
+            selected_provinces_reg = st.multiselect(
+                "🗺️ 증가 추이를 확인할 시도(지역)들을 선택하세요 (중복 선택 가능)",
+                available_provinces,
+                default=["서울"],
+                key="multiselect_ev_reg_final_fixed"
+            )
+            
+            if selected_provinces_reg:
+                df_reg_chart = df_reg_data[selected_provinces_reg].astype(int)
+                
+                # 📈 전기차 등록대수 선 그래프 출력
+                st.line_chart(df_reg_chart, use_container_width=True)
+                
+                # 하단 미니 데이터 테이블
+                st.dataframe(df_reg_chart.T, use_container_width=True)
+            else:
+                st.warning("최소 하나 이상의 지역을 선택해 주세요.")
+
+        # 📌 [메뉴 2] 시도별 충전소 현황 🌟 (기존 띄어쓰기 오류 해결: "시도별 충전소 현황")
+        elif menu == "시도별 충전소 현황":
+            st.markdown("### ⚡ 시도별 충전소 구축 현황 연도별 추이")
+            st.caption("선택한 지역의 충전기 유형별(완속, 급속, 전체) 연도별 증가 추이를 그래프로 분석합니다.")
+            
+            selected_provinces_chg = st.multiselect(
+                "🗺️ 충전기 추이를 확인할 시도(지역)들을 선택하세요 (중복 선택 가능)",
+                available_provinces,
+                default=["서울"],
+                key="multiselect_ev_chg_final_fixed"
+            )
+            
+            if selected_provinces_chg:
+                target_charger_cols = []
+                # 사용자가 고른 지역들의 완속, 급속, 전체 컬럼들을 안전하게 매핑하여 수집합니다.
+                for prov in selected_provinces_chg:
+                    for suffix in ["완속", "급속", "전체"]:
+                        full_col_name = f"{prov}_{suffix}"
+                        if full_col_name in df_chg_data.columns:
+                            target_charger_cols.append(full_col_name)
+                
+                if target_charger_cols:
+                    # 데이터프레임에서 선택된 세부 컬럼들만 안전하게 파싱한 뒤 NaN 값을 처리하고 숫자형 변환
+                    df_chg_chart = df_chg_data[target_charger_cols].fillna(0).astype(int)
+                    
+                    # 📈 [충전소 그래프 정상 작동] 완속, 급속, 전체 선들이 각각 고유한 색상으로 캔버스에 그려집니다.
+                    st.line_chart(df_chg_chart, use_container_width=True)
+                    
+                    # 하단 미니 데이터 테이블 제공
+                    st.dataframe(df_chg_chart.T, use_container_width=True)
+                else:
+                    st.error("선택한 지역에 매칭되는 충전소 컬럼(지역_완속, 지역_급속, 지역_전체)을 DB에서 찾을 수 없습니다.")
+            else:
+                st.warning("최소 하나 이상의 지역을 선택해 주세요.")
+
+        # ── 하단 원본 raw 데이터 테이블 전체 보기 (접이식) ──
+        st.write("")
+        with st.expander("🔍 DB 원본 실시간 데이터 테이블 전체 보기"):
+            tab1, tab2 = st.tabs(["ev_registration (전기차 원본)", "ev_charger (충전기 원본)"])
+            with tab1:
+                st.dataframe(df_reg_raw, use_container_width=True)
+            with tab2:
+                st.dataframe(df_chg_raw, use_container_width=True)
 
 
 # ----------------------------------------------------------------------
